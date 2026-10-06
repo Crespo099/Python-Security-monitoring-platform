@@ -1,0 +1,11 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Start Secure Web Activity Monitor",
+      "type": "shell",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\run-local.ps1",
+      "problemMatcher": []
+    }
+  ]
+}

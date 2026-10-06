@@ -1,0 +1,21 @@
+services:
+  monitor:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////data/monitor.db}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - monitor-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  monitor-data:
