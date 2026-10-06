@@ -1,6 +1,7 @@
 {
   "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
   "python.terminal.activateEnvironment": true,
+  "git.path": "C:\\Program Files\\Git\\cmd\\git.exe",
   "files.exclude": {
     "**/__pycache__": true,
     "**/.pytest_cache": true
