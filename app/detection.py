@@ -1,3 +1,4 @@
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -51,6 +52,54 @@ def analyze_event(db: Session, event: ActivityEvent) -> None:
 _model_cache: dict[int, tuple[int, object]] = {}
 
 
+def _behavior_features(rows: list[ActivityEvent]) -> np.ndarray:
+    features = []
+    recent_events: deque[datetime] = deque()
+    recent_failures: deque[datetime] = deque()
+    event_type_counts: Counter[str] = Counter()
+    seen_source_ips: set[str] = set()
+    previous_time: datetime | None = None
+
+    for row in rows:
+        occurred_at = row.occurred_at
+        if occurred_at.tzinfo is None:
+            occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+        occurred_at = occurred_at.astimezone(timezone.utc)
+        event_type = row.event_type.lower()
+        is_failed_login = event_type in {"login_failed", "auth_failed", "failed_login"}
+        five_minutes_ago = occurred_at - timedelta(minutes=5)
+        ten_minutes_ago = occurred_at - timedelta(minutes=10)
+        while recent_events and recent_events[0] < five_minutes_ago:
+            recent_events.popleft()
+        while recent_failures and recent_failures[0] < ten_minutes_ago:
+            recent_failures.popleft()
+
+        seconds_since_previous = 3600.0 if previous_time is None else min(
+            max((occurred_at - previous_time).total_seconds(), 0.0), 3600.0
+        )
+        hour_of_week = occurred_at.weekday() * 24 + occurred_at.hour
+        angle = 2 * np.pi * hour_of_week / 168
+        features.append([
+            np.sin(angle),
+            np.cos(angle),
+            np.log1p(seconds_since_previous),
+            np.log1p(len(recent_events)),
+            np.log1p(len(recent_failures)),
+            float(bool(row.source_ip and row.source_ip not in seen_source_ips)),
+            np.log1p(event_type_counts[event_type]),
+        ])
+
+        recent_events.append(occurred_at)
+        if is_failed_login:
+            recent_failures.append(occurred_at)
+        event_type_counts[event_type] += 1
+        if row.source_ip:
+            seen_source_ips.add(row.source_ip)
+        previous_time = occurred_at
+
+    return np.asarray(features, dtype=float).reshape((-1, 7))
+
+
 def _anomaly_score(db: Session, event: ActivityEvent) -> None:
     # The model uses aggregate numeric features only; it does not learn URL contents.
     try:
@@ -58,23 +107,30 @@ def _anomaly_score(db: Session, event: ActivityEvent) -> None:
     except ImportError:
         return
     cached = _model_cache.get(event.user_id)
-    if cached is None or event.id - cached[0] >= 50:
-        rows = db.scalars(select(ActivityEvent).where(ActivityEvent.user_id == event.user_id)
-                          .order_by(ActivityEvent.occurred_at.desc()).limit(300)).all()
-        if len(rows) < 30:
+    rows = db.scalars(select(ActivityEvent).where(ActivityEvent.user_id == event.user_id)
+                      .order_by(ActivityEvent.id.desc()).limit(301)).all()
+    rows.reverse()
+    rows.sort(key=lambda row: row.occurred_at.replace(tzinfo=timezone.utc)
+              if row.occurred_at.tzinfo is None else row.occurred_at.astimezone(timezone.utc))
+    if not rows:
+        return
+    features = _behavior_features(rows)
+    current_index = next((index for index, row in enumerate(rows) if row.id == event.id), None)
+    if current_index is None:
+        return
+    training_features = np.delete(features, current_index, axis=0)
+    events_since_training = sum(row.id > cached[0] for row in rows) if cached else 0
+    if cached is None or events_since_training >= 50:
+        if len(training_features) < 30:
             return
-        features = np.array([[len(r.event_type), r.occurred_at.hour, len(r.url or ""),
-                              int(r.event_type in {"login_failed", "auth_failed", "failed_login"})]
-                             for r in rows], dtype=float)
-        if len(np.unique(features, axis=0)) < 5:
+        if len(np.unique(training_features, axis=0)) < 5:
             return
         model = IsolationForest(n_estimators=80, contamination=0.05, random_state=17)
-        model.fit(features)
+        model.fit(training_features)
         _model_cache[event.user_id] = (event.id, model)
     else:
         model = cached[1]
-    current = np.array([[len(event.event_type), event.occurred_at.hour, len(event.url or ""),
-                         int(event.event_type.lower() in {"login_failed", "auth_failed", "failed_login"})]], dtype=float)
+    current = features[current_index:current_index + 1]
     score = float(-model.score_samples(current)[0])
     if model.predict(current)[0] == -1:
         _alert(db, event, "ml_anomaly", "low", "Unusual activity pattern",
